@@ -9,6 +9,7 @@
 - 含缺测值、全缺测、完全无 null 的文件；
 - 关闭统计写入（no_stats）、缺少 pm25 列（missing_column）；
 - 截断的损坏文件（unreadable）、非法分区目录（保守保留）；
+- **footer max 被转码写错的文件**（station-E，供统计验真演示）；
 - 多 row group 文件（统计须跨行组聚合）。
 
 同时生成 data/manifest/manifest.json 供清单模式演示。
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 from pathlib import Path
 
 import pyarrow as pa
@@ -28,7 +30,8 @@ PM25 = "pm25"
 
 
 def _write(path: Path, values: list, *, write_stats: bool = True,
-           extra_columns: dict | None = None, row_group_size: int | None = None) -> None:
+           extra_columns: dict | None = None, row_group_size: int | None = None,
+           compression: str = "snappy", use_dictionary: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {PM25: pa.array(values, type=pa.float64())}
     if extra_columns:
@@ -38,8 +41,36 @@ def _write(path: Path, values: list, *, write_stats: bool = True,
         table, path,
         write_statistics=write_stats,
         row_group_size=row_group_size or len(values),
-        compression="snappy",
+        compression=compression,
+        use_dictionary=use_dictionary,
     )
+
+
+def _write_wrong_footer_max(path: Path, values: list, fake_max: float) -> None:
+    """写入后篡改 footer 统计中的 max，模拟“转码写错最大值”的文件。
+
+    thrift compact 协议中 double 为小端字节序；footer 的 Statistics 同时
+    记录 max 与 max_value 两处（位于文件末尾），只替换最后两处，
+    数据页不受影响：footer max 变为 fake_max，真实数据仍含更大值。
+    """
+    _write(path, values, compression="NONE", use_dictionary=False)
+    real_max = max(v for v in values if v is not None)
+    raw = path.read_bytes()
+    pat = struct.pack("<d", float(real_max))
+    offs: list[int] = []
+    i = raw.find(pat)
+    while i != -1:
+        offs.append(i)
+        i = raw.find(pat, i + 1)
+    if len(offs) < 2:
+        raise RuntimeError(f"footer 中未找到 max/max_value 两处统计: {path}")
+    buf = bytearray(raw)
+    for off in offs[-2:]:
+        buf[off:off + 8] = struct.pack("<d", float(fake_max))
+    path.write_bytes(bytes(buf))
+    # 自检：footer max 已被篡改、真实数据未受影响
+    st = pq.ParquetFile(path).metadata.row_group(0).column(0).statistics
+    assert st.max == fake_max, f"footer 篡改失败: {path}"
 
 
 def generate(archive: Path, manifest: Path) -> None:
@@ -85,6 +116,13 @@ def generate(archive: Path, manifest: Path) -> None:
     # --- 站点 D：边界值，验证闭区间与 min==max --------------------------
     _write(archive / "station=station-D/date=2026-01-01/part-000.parquet", [35.0, 35.0])
     _write(archive / "station=station-D/date=2026-01-02/part-000.parquet", [34.9, 34.9])
+
+    # --- 站点 E：footer max 被转码写错（真实 max=96.0，footer 记为 42.0） --
+    # 查询 pm25>=75 时，按 footer 统计会把该文件误判为不相交而漏读；
+    # 统计验真实读 PM2.5 列即可发现 max 不符。
+    _write_wrong_footer_max(
+        archive / "station=station-E/date=2026-01-01/part-badmax.parquet",
+        [12.0, 42.0, 96.0], fake_max=42.0)
 
     # --- 生成清单（真实替换流程请用 os.replace 原子换入） ---------------
     entries = []

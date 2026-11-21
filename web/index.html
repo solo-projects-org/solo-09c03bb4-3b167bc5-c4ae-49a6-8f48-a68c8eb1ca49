@@ -48,6 +48,10 @@
   .tag.exclude { background:#ffebe9; color:var(--exclude); }
   .tag.status-ok { background:#dafbe1; color:var(--keep); }
   .tag.status-bad { background:#fff8c5; color:var(--warn); }
+  .tag.v-pass { background:#dafbe1; color:var(--keep); }
+  .tag.v-warn { background:#fff8c5; color:var(--warn); }
+  .tag.v-bad  { background:#ffebe9; color:var(--exclude); }
+  .tag.v-run  { background:#ddf4ff; color:var(--blue); }
   .reasons { margin:2px 0 0; padding-left:16px; color:#57606a; }
   .reasons li { margin:1px 0; }
   .notes { margin-top:10px; font-size:12px; color:var(--warn); }
@@ -55,6 +59,15 @@
   .scroll { max-height:560px; overflow:auto; border:1px solid var(--border); border-radius:6px; }
   .err { background:#ffebe9; border:1px solid var(--exclude); color:var(--exclude);
          padding:10px; border-radius:6px; font-size:13px; margin-bottom:10px; }
+  .wide { grid-column: 1 / -1; }
+  .btnrow { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
+  .btnrow button { margin-top:0; width:auto; padding:6px 12px; font-size:13px; }
+  .verify-head { display:flex; justify-content:space-between; align-items:baseline;
+                 gap:10px; flex-wrap:wrap; }
+  .verify-head h2 { margin:0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  input[type="checkbox"].pick { width:auto; }
   details { margin-top:8px; }
   summary { cursor:pointer; font-size:12px; color:var(--blue); }
   code { background:var(--bg); padding:1px 4px; border-radius:4px; font-size:11px; }
@@ -63,7 +76,8 @@
 <body>
 <header>
   <h1>PM2.5 Parquet 档案读取计划生成器</h1>
-  <p>仅读取 Parquet footer / 行组统计（min/max/null_count），不扫描数据行；统计缺失或损坏时保守保留，计划绑定档案快照。</p>
+  <p>仅读取 Parquet footer / 行组统计（min/max/null_count），不扫描数据行；统计缺失或损坏时保守保留，计划绑定档案快照。
+     清单模式可开启统计验真：实读 PM2.5 列核对 footer 统计，未通过验真的文件不做统计裁剪。</p>
 </header>
 <main>
   <section class="card">
@@ -106,7 +120,7 @@
         <table>
           <thead><tr>
             <th>结论</th><th>文件 / 分区</th><th>min</th><th>max</th><th>null数</th>
-            <th>行数</th><th>统计状态</th><th>字节</th><th>保留 / 排除原因</th>
+            <th>行数</th><th>统计状态</th><th>验真</th><th>字节</th><th>保留 / 排除原因</th>
           </tr></thead>
           <tbody id="rows"></tbody>
         </table>
@@ -121,6 +135,39 @@
       </details>
     </div>
     <p id="placeholder" class="muted">设置条件后点击“生成读取计划”。</p>
+  </section>
+
+  <section class="card wide" id="verifyCard" style="display:none">
+    <div class="verify-head">
+      <h2>统计验真（清单模式）</h2>
+      <span class="muted" id="verifyMeta"></span>
+    </div>
+    <p class="muted">
+      勾选清单中的 Parquet 文件后点击“开始验真”：服务在后台<strong>实读 PM2.5 列</strong>，
+      重算 min/max/null_count 并与 footer 统计逐项核对。验真结论按清单登记的版本
+      （路径 + 大小 + 修改时间）持久化，重启后沿用；同名文件换版后须重新验真。
+      未通过验真的文件在计划中一律保守保留，不做统计裁剪。
+    </p>
+    <div class="btnrow">
+      <button id="btnVerifyGo">开始验真选中文件</button>
+      <button id="btnVerifyAll" class="secondary">全选</button>
+      <button id="btnVerifyNone" class="secondary">全不选</button>
+      <button id="btnVerifyRefresh" class="secondary">刷新验真状态</button>
+      <label class="check" style="margin:0">
+        <input type="checkbox" id="verifyForce" /> 强制重验（忽略已有结论）
+      </label>
+    </div>
+    <div id="verifyMsg"></div>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th></th><th>文件</th><th>版本（大小 / mtime_ns）</th><th>状态</th>
+          <th>footer min/max/null/行数</th><th>实读 min/max/null/行数</th>
+          <th>不符项 / 失败原因</th><th>完成时间</th>
+        </tr></thead>
+        <tbody id="verifyRows"></tbody>
+      </table>
+    </div>
   </section>
 </main>
 
@@ -198,9 +245,24 @@ function renderPlan(plan) {
       <td>${f.pm25_min ?? "—"}</td><td>${f.pm25_max ?? "—"}</td>
       <td>${f.null_count ?? "—"}</td><td>${f.row_count ?? "—"}</td>
       <td><span class="tag ${bad.has(f.stats_status) ? "status-bad" : "status-ok"}">${f.stats_status}</span></td>
+      <td>${verifyTag(f.verify_status)}</td>
       <td>${fmtBytes(f.size_bytes)}</td>
       <td><ul class="reasons">${f.reasons.map(x => `<li>${x}</li>`).join("")}</ul></td>
     </tr>`).join("");
+}
+
+function verifyTag(status) {
+  const map = {
+    passed: ["验真通过", "v-pass"],
+    unverified: ["未验真", "v-warn"],
+    running: ["验真中…", "v-run"],
+    mismatch: ["验真不符", "v-bad"],
+    error: ["验真失败", "v-bad"],
+    version_mismatch: ["版本不符", "v-warn"],
+  };
+  if (!status || !map[status]) return '<span class="muted">—</span>';
+  const [label, cls] = map[status];
+  return `<span class="tag ${cls}">${label}</span>`;
 }
 
 async function showError(r) {
@@ -249,6 +311,103 @@ $("btnPreview").addEventListener("click", async () => {
   const notes = p.notes.length ? `<div class="notes">⚠ ${p.notes.join("<br>⚠ ")}</div>` : "";
   $("previewContent").innerHTML = head + table + notes;
 });
+
+// ------------------------------------------------------------------ //
+// 统计验真
+// ------------------------------------------------------------------ //
+let verifyPolling = null;
+
+function statTriple(obj) {
+  if (!obj) return "—";
+  const f = (v) => (v === null || v === undefined) ? "—" : v;
+  return `${f(obj.pm25_min)} / ${f(obj.pm25_max)} / ${f(obj.null_count)} / ${f(obj.row_count)}`;
+}
+
+function verifyStateTag(state) {
+  const map = {
+    passed: ["通过", "v-pass"], mismatch: ["不符", "v-bad"],
+    error: ["失败", "v-bad"], running: ["验真中…", "v-run"],
+    unverified: ["未验真", "v-warn"],
+  };
+  const [label, cls] = map[state] || [state, "v-warn"];
+  return `<span class="tag ${cls}">${label}</span>`;
+}
+
+async function loadVerifyStatus() {
+  const r = await fetch("/api/verify/status");
+  if (!r.ok) return;
+  const v = await r.json();
+  if (!v.enabled) { $("verifyCard").style.display = "none"; return; }
+  $("verifyCard").style.display = "block";
+  if (!v.manifest_mode) {
+    $("verifyMeta").textContent = "当前为目录扫描模式，统计验真仅支持清单模式";
+    $("verifyRows").innerHTML = "";
+    return;
+  }
+  $("verifyMeta").textContent = `结论库: ${v.store_path || "（未持久化）"}`;
+  $("verifyRows").innerHTML = v.files.map(f => {
+    const rec = f.record;
+    const mismatch = rec && rec.mismatches && rec.mismatches.length
+      ? rec.mismatches.join("；") : "";
+    const err = rec && rec.error ? rec.error : "";
+    const outdated = f.outdated_record
+      ? `<br><span class="muted">该文件已换版，旧版本结论（${f.outdated_record.status}）不再适用，须重新验真</span>` : "";
+    return `<tr>
+      <td><input type="checkbox" class="pick vpick" value="${f.path}"></td>
+      <td><code>${f.path}</code>${outdated}</td>
+      <td class="mono">${f.size} / ${f.mtime_ns}</td>
+      <td>${verifyStateTag(f.state)}</td>
+      <td class="mono">${statTriple(rec ? rec.expected : null)}</td>
+      <td class="mono">${rec && rec.actual ? statTriple(rec.actual) : "—"}</td>
+      <td>${mismatch ? `<span style="color:var(--exclude)">${mismatch}</span>` : ""}${err ? `<span style="color:var(--exclude)">${err}</span>` : ""}${!mismatch && !err ? "—" : ""}</td>
+      <td class="muted">${rec && rec.finished_at ? rec.finished_at : "—"}</td>
+    </tr>`;
+  }).join("");
+  const anyRunning = v.files.some(f => f.state === "running");
+  if (anyRunning && !verifyPolling) {
+    verifyPolling = setInterval(async () => {
+      await loadVerifyStatus();
+    }, 1500);
+  } else if (!anyRunning && verifyPolling) {
+    clearInterval(verifyPolling);
+    verifyPolling = null;
+    // 验真全部结束后自动刷新计划，让裁剪立即生效
+    if (planSnapshotId) $("btnPlan").click();
+  }
+}
+
+$("btnVerifyAll").addEventListener("click", () => {
+  document.querySelectorAll(".vpick").forEach(c => c.checked = true);
+});
+$("btnVerifyNone").addEventListener("click", () => {
+  document.querySelectorAll(".vpick").forEach(c => c.checked = false);
+});
+$("btnVerifyRefresh").addEventListener("click", loadVerifyStatus);
+$("btnVerifyGo").addEventListener("click", async () => {
+  const paths = Array.from(document.querySelectorAll(".vpick:checked")).map(c => c.value);
+  if (!paths.length) {
+    $("verifyMsg").innerHTML = '<div class="err">请先勾选要验真的文件</div>';
+    return;
+  }
+  const r = await fetch("/api/verify/stats", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({paths, force: $("verifyForce").checked}),
+  });
+  if (!r.ok) {
+    let detail;
+    try { detail = (await r.json()).detail; } catch { detail = r.statusText; }
+    $("verifyMsg").innerHTML = `<div class="err">HTTP ${r.status}：${detail}</div>`;
+    return;
+  }
+  const body = await r.json();
+  const rejected = body.rejected.length
+    ? `<div class="err">已拒绝 ${body.rejected.length} 项：${body.rejected.map(x => `${x.path}（${x.reason}）`).join("；")}</div>` : "";
+  $("verifyMsg").innerHTML = rejected;
+  await loadVerifyStatus();
+});
+
+loadVerifyStatus().catch(() => {});
+
 
 loadStations().catch(e => {
   $("snap").className = "snap stale";

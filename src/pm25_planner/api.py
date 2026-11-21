@@ -1,4 +1,4 @@
-"""FastAPI 应用：读取计划的生成、快照核对与预览执行。"""
+"""FastAPI 应用：读取计划的生成、快照核对、预览执行与统计验真。"""
 from __future__ import annotations
 
 import json
@@ -14,13 +14,19 @@ from .models import (
     PlanResponse,
     PreviewResponse,
     SnapshotResponse,
+    VerifyFileView,
+    VerifyRecordOut,
     VerifyRequest,
     VerifyResponse,
+    VerifyStatusResponse,
+    VerifySubmitRequest,
+    VerifySubmitResponse,
 )
 from .parquet_meta import duckdb_cross_check
 from .planner import build_plan
 from .reader import execute_preview
-from .snapshot import SnapshotStore
+from .snapshot import Snapshot, SnapshotStore
+from .verification import VerifyGate, VerifyStore
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
@@ -28,16 +34,24 @@ WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = SnapshotStore(settings)
+    # 统计验真仅支持清单模式；扫描模式下开关自动失效
+    verify_store = (
+        VerifyStore(settings)
+        if settings.verify_enabled and settings.manifest_path is not None
+        else None
+    )
     app = FastAPI(
         title="PM2.5 Parquet 档案读取计划服务",
-        version="1.0.0",
+        version="1.1.0",
         description="基于分区值与 min/max/null_count 元数据生成可核对的文件读取计划，"
-                    "统计缺失/损坏一律保守保留，计划绑定档案快照。",
+                    "统计缺失/损坏一律保守保留，计划绑定档案快照；"
+                    "清单模式可开启统计验真，实读 PM2.5 列核对 footer 统计。",
     )
     app.state.settings = settings
     app.state.store = store
+    app.state.verify_store = verify_store
 
-    def _snapshot_or_503():
+    def _snapshot_or_503() -> Snapshot:
         try:
             return store.current()
         except FileNotFoundError as exc:
@@ -51,12 +65,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail=f"清单 JSON 不完整或损坏: {exc.msg}（请确认替换是否原子完成）",
             )
 
+    def _gate_or_none(snap: Snapshot) -> VerifyGate | None:
+        """验真开启且为清单模式时返回放行闸门，否则 None（行为与旧版一致）。"""
+        if verify_store is None or snap.manifest_entries is None:
+            return None
+        return VerifyGate(verify_store, snap)
+
     @app.get("/api/health")
     def health() -> dict:
         try:
             snap = store.current()
             return {"status": "ok", "snapshot_id": snap.snapshot_id,
-                    "file_count": len(snap.files), "source": snap.source}
+                    "file_count": len(snap.files), "source": snap.source,
+                    "verify_enabled": verify_store is not None}
         except Exception as exc:  # noqa: BLE001 - 健康检查需要兜住全部启动期异常
             return {"status": "degraded", "error": f"{exc.__class__.__name__}: {exc}"}
 
@@ -85,7 +106,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "current_snapshot_id": snap.snapshot_id,
                 },
             )
-        return build_plan(snap, req)
+        return build_plan(snap, req, _gate_or_none(snap))
 
     @app.post("/api/plan/verify", response_model=VerifyResponse)
     def verify_snapshot(req: VerifyRequest) -> VerifyResponse:
@@ -105,7 +126,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         snap = _snapshot_or_503()
         bound_id = req.expected_snapshot_id or snap.snapshot_id
         # 预览内部再次按当前快照判定；快照变化时 valid_snapshot=False
-        return execute_preview(snap, bound_id, req, settings)
+        return execute_preview(snap, bound_id, req, settings, _gate_or_none(snap))
+
+    # ------------------------------------------------------------------ #
+    # 统计验真（仅清单模式）：实读 PM2.5 列核对 footer 统计
+    # ------------------------------------------------------------------ #
+    def _verify_available() -> None:
+        if not settings.verify_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="统计验真未开启（设置 PM25_VERIFY_ENABLED=1 后重启生效）",
+            )
+        if settings.manifest_path is None or verify_store is None:
+            raise HTTPException(
+                status_code=400,
+                detail="统计验真仅支持清单模式（需配置 PM25_MANIFEST_PATH）",
+            )
+
+    @app.get("/api/verify/status", response_model=VerifyStatusResponse)
+    def verify_status() -> VerifyStatusResponse:
+        enabled = settings.verify_enabled
+        manifest_mode = settings.manifest_path is not None
+        store_path = (
+            str(verify_store.store_path)
+            if verify_store is not None and verify_store.store_path is not None
+            else None
+        )
+        files: list[VerifyFileView] = []
+        if enabled and manifest_mode and verify_store is not None:
+            snap = _snapshot_or_503()
+            for rel, (size, mtime_ns) in sorted((snap.manifest_entries or {}).items()):
+                rec = verify_store.get(rel, size, mtime_ns)
+                outdated = None if rec is not None else verify_store.latest_for_path(rel)
+                files.append(VerifyFileView(
+                    path=rel, size=size, mtime_ns=mtime_ns,
+                    state=rec.status if rec is not None else "unverified",  # type: ignore[arg-type]
+                    record=VerifyRecordOut(**rec.to_dict()) if rec is not None else None,
+                    outdated_record=(
+                        VerifyRecordOut(**outdated.to_dict()) if outdated is not None else None
+                    ),
+                ))
+        return VerifyStatusResponse(
+            enabled=enabled, manifest_mode=manifest_mode,
+            store_path=store_path, files=files,
+        )
+
+    @app.post("/api/verify/stats", response_model=VerifySubmitResponse)
+    def submit_verify(req: VerifySubmitRequest) -> VerifySubmitResponse:
+        _verify_available()
+        assert verify_store is not None
+        snap = _snapshot_or_503()
+        submitted, rejected = verify_store.submit(req.paths, snap, force=req.force)
+        return VerifySubmitResponse(
+            submitted=[VerifyRecordOut(**r.to_dict()) for r in submitted],
+            rejected=rejected,
+        )
 
     @app.get("/api/debug/duckdb-stats")
     def debug_duckdb_stats(path: str) -> dict:

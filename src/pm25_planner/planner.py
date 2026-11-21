@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, Protocol
 
 from .models import FileDecision, PlanRequest, PlanResponse
 from .parquet_meta import FileMeta
@@ -31,6 +31,17 @@ NO_STATS_KEEP = "NO_STATS_KEEP"
 NOT_EXISTS_KEEP = "FILE_MISSING_KEEP"
 STATS_MATCH_KEEP = "STATS_MATCH_KEEP"
 NULLS_INCLUDED_KEEP = "NULLS_INCLUDED_KEEP"
+STATS_UNVERIFIED_KEEP = "STATS_UNVERIFIED_KEEP"
+
+
+class StatsVerifyGate(Protocol):
+    """统计验真放行接口（由 verification.VerifyGate 实现，测试可注入假实现）。
+
+    返回对象须含 ``allow_stats_pruning`` / ``status`` / ``detail`` 三个属性。
+    """
+
+    def check(self, meta: FileMeta) -> Any:  # pragma: no cover - 协议声明
+        ...
 
 
 def _intersects(lo: float, hi: float, q_lo: float | None, q_hi: float | None) -> bool:
@@ -41,11 +52,17 @@ def _intersects(lo: float, hi: float, q_lo: float | None, q_hi: float | None) ->
     return True
 
 
-def decide_file(meta: FileMeta, req: PlanRequest) -> FileDecision:
-    """对单个文件执行完整判定链，返回保留/排除结论与全部原因。"""
+def decide_file(meta: FileMeta, req: PlanRequest,
+                gate: StatsVerifyGate | None = None) -> FileDecision:
+    """对单个文件执行完整判定链，返回保留/排除结论与全部原因。
+
+    ``gate`` 非空表示统计验真已开启：仅“磁盘版本与清单一致且验真通过”
+    的文件允许按统计裁剪，其余在分区裁剪之后一律保守保留。
+    """
     reasons: list[str] = []
     codes: list[str] = []
     keep = True
+    verify_status: str | None = None
 
     # ---- 0. 文件不存在（清单引用了已消失的文件）：保守保留 --------------
     if not meta.exists:
@@ -98,6 +115,15 @@ def decide_file(meta: FileMeta, req: PlanRequest) -> FileDecision:
         codes.append(NO_STATS_KEEP)
         return _build(meta, True, reasons, codes)
 
+    # ---- 4.5 统计验真闸门（开启时）：未放行文件不做任何统计裁剪 ----------
+    if gate is not None:
+        verdict = gate.check(meta)
+        verify_status = verdict.status
+        reasons.append(verdict.detail)
+        if not verdict.allow_stats_pruning:
+            codes.append(STATS_UNVERIFIED_KEEP)
+            return _build(meta, True, reasons, codes, verify_status=verify_status)
+
     # stats_status == ok
     range_requested = req.pm25_min is not None or req.pm25_max is not None
     # min/max 同时为 None：该文件没有任何非空值（全 null 列），统计仍可信
@@ -129,28 +155,29 @@ def decide_file(meta: FileMeta, req: PlanRequest) -> FileDecision:
     if has_nulls and req.include_nulls:
         reasons.append(f"文件含 {meta.null_count} 个缺测值，按“包含缺测”保留")
         codes.append(NULLS_INCLUDED_KEEP)
-        return _build(meta, True, reasons, codes)
+        return _build(meta, True, reasons, codes, verify_status=verify_status)
 
     if not req.include_nulls and has_nulls and not has_possible_value:
         if not partition_safe:
             reasons.append("分区值不完整无法确认归属，即使按“不包含缺测”本可排除，仍保守保留")
-            return _build(meta, True, reasons, codes)
+            return _build(meta, True, reasons, codes, verify_status=verify_status)
         reasons.append(
             f"文件含 {meta.null_count} 个缺测值且无落在区间内的非空值，"
             "按“不包含缺测”排除"
         )
         codes.append(NO_NULLS_SKIPPED)
-        return _build(meta, False, reasons, codes)
+        return _build(meta, False, reasons, codes, verify_status=verify_status)
 
     if not partition_safe and not has_possible_value:
         # 统计虽不相交，但分区归属无法确认：不做排除，强制保守保留
         reasons.append("尽管统计区间与请求不相交，因分区值不完整无法确认归属，仍保守保留")
-        return _build(meta, True, reasons, codes)
+        return _build(meta, True, reasons, codes, verify_status=verify_status)
 
-    return _build(meta, has_possible_value, reasons, codes)
+    return _build(meta, has_possible_value, reasons, codes, verify_status=verify_status)
 
 
-def _build(meta: FileMeta, keep: bool, reasons: list[str], codes: list[str]) -> FileDecision:
+def _build(meta: FileMeta, keep: bool, reasons: list[str], codes: list[str],
+           verify_status: str | None = None) -> FileDecision:
     return FileDecision(
         path=meta.rel_path,
         station=meta.station,
@@ -165,12 +192,15 @@ def _build(meta: FileMeta, keep: bool, reasons: list[str], codes: list[str]) -> 
         row_count=meta.row_count,
         stats_status=meta.stats_status,
         exists=meta.exists,
+        verify_status=verify_status,  # type: ignore[arg-type]
     )
 
 
-def build_plan(snapshot: Snapshot, req: PlanRequest) -> PlanResponse:
+def build_plan(snapshot: Snapshot, req: PlanRequest,
+               gate: StatsVerifyGate | None = None) -> PlanResponse:
     """对快照内全部文件执行判定，汇总计划字节数与可选分区值。"""
-    decisions = [decide_file(m, req) for m in sorted(snapshot.files, key=lambda m: m.rel_path)]
+    decisions = [decide_file(m, req, gate)
+                 for m in sorted(snapshot.files, key=lambda m: m.rel_path)]
     kept = [d.path for d in decisions if d.decision == "KEEP"]
     planned_bytes = sum(d.size_bytes for d in decisions if d.decision == "KEEP")
 
@@ -178,6 +208,18 @@ def build_plan(snapshot: Snapshot, req: PlanRequest) -> PlanResponse:
     dates = sorted({m.date for m in snapshot.files if m.date})
 
     notes: list[str] = []
+    if gate is not None:
+        notes.append(
+            "统计验真已开启：仅“磁盘版本与清单一致且验真通过”的文件按统计裁剪，"
+            "其余文件在站点/日期筛选后一律保守保留"
+        )
+        unverified = [d for d in decisions
+                      if STATS_UNVERIFIED_KEEP in d.reason_codes]
+        if unverified:
+            notes.append(
+                f"{len(unverified)} 个文件未获统计验真放行"
+                "（未验真/验真中/不符/失败/版本不一致），已保守保留"
+            )
     if any(d.stats_status in ("unreadable", "no_stats", "missing_column") or
            not d.exists for d in decisions if d.decision == "KEEP"):
         notes.append(
@@ -203,6 +245,7 @@ def build_plan(snapshot: Snapshot, req: PlanRequest) -> PlanResponse:
         available_stations=stations,
         available_dates=dates,
         notes=notes,
+        verify_enabled=gate is not None,
     )
 
 

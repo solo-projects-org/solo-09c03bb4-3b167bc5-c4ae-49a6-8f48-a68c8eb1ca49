@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 def execute_preview(snapshot: Snapshot, current_id: str, request,
-                    settings: Settings) -> PreviewResponse:
-    plan = build_plan(snapshot, request)
+                    settings: Settings, gate=None) -> PreviewResponse:
+    plan = build_plan(snapshot, request, gate)
     valid = snapshot.snapshot_id == current_id
     notes: list[str] = list(plan.notes)
 

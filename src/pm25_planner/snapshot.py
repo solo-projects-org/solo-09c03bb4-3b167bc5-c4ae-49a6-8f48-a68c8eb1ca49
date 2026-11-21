@@ -35,6 +35,8 @@ class Snapshot:
     generated_at: str
     archive_dir: Path
     manifest_path: Path | None
+    # 清单模式：rel_path -> (size, mtime_ns)，即清单登记的版本标识；扫描模式为 None
+    manifest_entries: dict[str, tuple[int, int]] | None = None
 
     def by_relpath(self) -> dict[str, FileMeta]:
         return {f.rel_path: f for f in self.files}
@@ -104,6 +106,10 @@ class SnapshotStore:
                 generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 archive_dir=self._settings.archive_dir,
                 manifest_path=self._settings.manifest_path,
+                manifest_entries=(
+                    {rel: (size, mtime) for rel, size, mtime in entries}
+                    if self._settings.manifest_path is not None else None
+                ),
             )
             self._dir_fingerprint = fingerprint
             self._last = snapshot

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -70,6 +70,10 @@ class FileDecision(BaseModel):
     row_count: int | None = None
     stats_status: Literal["ok", "no_stats", "unreadable", "missing_column"]
     exists: bool
+    # 统计验真放行状态；None 表示验真未开启或不适用（统计本就不完整）
+    verify_status: Literal[
+        "passed", "unverified", "running", "mismatch", "error", "version_mismatch"
+    ] | None = None
 
 
 class PlanResponse(BaseModel):
@@ -86,6 +90,9 @@ class PlanResponse(BaseModel):
     available_stations: list[str]
     available_dates: list[str]
     notes: list[str]
+    verify_enabled: bool = Field(
+        default=False, description="本次计划是否启用了统计验真（未验真文件一律保守保留）"
+    )
 
 
 class SnapshotResponse(BaseModel):
@@ -118,3 +125,54 @@ class PreviewResponse(BaseModel):
     files_read: int
     rows: list[PreviewRow]
     notes: list[str]
+
+
+# --------------------------------------------------------------------- #
+# 统计验真（仅清单模式）
+# --------------------------------------------------------------------- #
+class VerifySubmitRequest(BaseModel):
+    """提交统计验真：指定清单内的 Parquet 相对路径。"""
+
+    paths: list[str] = Field(..., min_length=1, description="清单内的文件相对路径")
+    force: bool = Field(
+        default=False, description="True 时即使该版本已有结论也重新实读核验"
+    )
+
+
+class VerifyRecordOut(BaseModel):
+    """单文件单版本的验真结论。"""
+
+    path: str
+    size: int = Field(..., description="清单登记的文件字节数（版本标识之一）")
+    mtime_ns: int = Field(..., description="清单登记的修改时间纳秒（版本标识之一）")
+    status: Literal["running", "passed", "mismatch", "error"]
+    expected: dict[str, Any] | None = Field(None, description="footer 统计（提交时快照）")
+    actual: dict[str, Any] | None = Field(None, description="实读 PM2.5 列重算结果")
+    mismatches: list[str] = Field(default_factory=list, description="逐项不符说明")
+    error: str | None = Field(None, description="读取失败 / 版本不一致等原因")
+    started_at: str
+    finished_at: str | None = None
+
+
+class VerifyFileView(BaseModel):
+    """清单文件 + 当前版本验真状态（供网页勾选与展示）。"""
+
+    path: str
+    size: int
+    mtime_ns: int
+    state: Literal["unverified", "running", "passed", "mismatch", "error"]
+    record: VerifyRecordOut | None = None
+    # 同路径旧版本的最近一条结论：存在即说明“换版须重新验真”
+    outdated_record: VerifyRecordOut | None = None
+
+
+class VerifyStatusResponse(BaseModel):
+    enabled: bool
+    manifest_mode: bool
+    store_path: str | None
+    files: list[VerifyFileView]
+
+
+class VerifySubmitResponse(BaseModel):
+    submitted: list[VerifyRecordOut]
+    rejected: list[dict[str, str]]
